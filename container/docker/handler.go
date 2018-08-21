@@ -172,6 +172,8 @@ func newDockerContainerHandler(
 		zfsParent        string
 	)
 	switch storageDriver {
+	case devicemapperStorageDriver:
+		rootfsStorageDir = path.Join(storageDir, string(storageDriver), "metadata", rwLayerID)
 	case aufsStorageDriver:
 		rootfsStorageDir = path.Join(storageDir, string(aufsStorageDriver), aufsRWLayer, rwLayerID)
 	case overlayStorageDriver:
@@ -193,6 +195,36 @@ func newDockerContainerHandler(
 		return nil, fmt.Errorf("failed to inspect container %q: %v", id, err)
 	}
 
+	// We assume than if Container networkmodel is not empty then Container may be is subContainer,
+	// We should append parent labels to child.
+	// If Inspect parent fails then ignore and continue.
+	labels := make(map[string]string)
+	hasParent := ctnr.HostConfig.NetworkMode != "" && ctnr.HostConfig.IpcMode != "" &&
+		string(ctnr.HostConfig.NetworkMode) == string(ctnr.HostConfig.IpcMode)
+
+	if hasParent {
+		// IpcMode format "container:container_id"  Example: "container:73642c314137241ace36d91a9a326116ba92f1e16fcb5245f90ae2d3ecceb357"
+		params := strings.Split(string(ctnr.HostConfig.IpcMode), ":")
+
+		// Check params format, If length is not correct, then ignore
+		if len(params) == 2 {
+			// We try to Inspect parent container, if success append labels to child
+			parentCtnr, err := client.ContainerInspect(context.Background(), params[1])
+			if err == nil {
+				for k, v := range parentCtnr.Config.Labels {
+					labels[replaceLabels(k)] = v
+				}
+			} else {
+				glog.V(1).Info("Inspect Container Parent failed, err:%v", err)
+			}
+		}
+	}
+
+	// Append child Container Labels to labels
+	for k, v := range ctnr.Config.Labels {
+		labels[replaceLabels(k)] = v
+	}
+
 	// TODO: extract object mother method
 	handler := &dockerContainerHandler{
 		machineInfoFactory: machineInfoFactory,
@@ -202,7 +234,7 @@ func newDockerContainerHandler(
 		poolName:           thinPoolName,
 		rootfsStorageDir:   rootfsStorageDir,
 		envs:               make(map[string]string),
-		labels:             ctnr.Config.Labels,
+		labels:             labels,
 		includedMetrics:    includedMetrics,
 		zfsParent:          zfsParent,
 	}
@@ -267,6 +299,31 @@ func newDockerContainerHandler(
 	}
 
 	return handler, nil
+}
+
+// replace labels
+func replaceLabels(key string) string {
+	if key == "io.kubernetes.container.name" {
+		return "container.name"
+	} else if key == "io.kubernetes.docker.type" {
+		return "docker.type"
+	} else if key == "io.kubernetes.pod.name" {
+		return "pod.name"
+	} else if key == "io.kubernetes.pod.uid" {
+		return "pod.uid"
+	} else if key == "annotation.io.kubernetes.container.hash" {
+		return "container.hash"
+	} else if key == "annotation.io.kubernetes.container.terminationMessagePolicy" {
+		return "container.terminationMessagePolicy"
+	} else if key == "io.kubernetes.container.logpath" {
+		return "container.logpath"
+	} else if key == "annotation.io.kubernetes.container.terminationMessagePath" {
+		return "container.terminationMessagePath"
+	} else if key == "io.kubernetes.pod.namespace" {
+		return "namespace"
+	}
+
+	return key
 }
 
 // dockerFsHandler is a composite FsHandler implementation the incorporates
